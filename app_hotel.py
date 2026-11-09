@@ -14,7 +14,7 @@ import hotel_core as hc
 # PERINGATAN: kalau key sudah diisi, JANGAN push file ini ke GitHub publik (key akan bocor dan
 # bisa dipakai orang lain). Alternatif aman: kosongkan baris ini dan simpan key di Streamlit
 # Secrets dengan nama GEMINI_API_KEY. Kode ini membacanya otomatis.
-GEMINI_API_KEY = "AQ.Ab8RN6IkTkUwQtJWweYdKM9YPmf_OIepqs6xYijSD3ZAw6OkZw"
+GEMINI_API_KEY = ""
 
 GEMINI_MODELS = ["gemini-3.8-flash", "gemini-2.5-flash"]  # dicoba berurutan
 MAX_SUMMARIES_PER_SESSION = 5  # batas panggilan Gemini per pengunjung
