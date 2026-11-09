@@ -14,7 +14,7 @@ import hotel_core as hc
 # PERINGATAN: kalau key sudah diisi, JANGAN push file ini ke GitHub publik (key akan bocor dan
 # bisa dipakai orang lain). Alternatif aman: kosongkan baris ini dan simpan key di Streamlit
 # Secrets dengan nama GEMINI_API_KEY. Kode ini membacanya otomatis.
-GEMINI_API_KEY = ""
+GEMINI_API_KEY = "AQ.Ab8RN6IkTkUwQtJWweYdKM9YPmf_OIepqs6xYijSD3ZAw6OkZw"
 
 GEMINI_MODELS = ["gemini-3.8-flash", "gemini-2.5-flash"]  # dicoba berurutan
 MAX_SUMMARIES_PER_SESSION = 5  # batas panggilan Gemini per pengunjung
@@ -112,31 +112,41 @@ def input_signature(text, images, star, demo) -> str:
     return h.hexdigest()
 
 
+def fmt_num(x, spec: str) -> str:
+    return "–" if pd.isna(x) else format(x, spec)
+
+
 def bullet_chart(table: pd.DataFrame, tier: int):
-    """Batang = skor review (gabungan), garis merah = rata-rata hotel bintang `tier`."""
+    """Batang = skor review (gabungan), garis merah = rata-rata hotel bintang `tier` (kalau ada)."""
     d = table.dropna(subset=["fused"])[["aspek", "fused", "tier_mean"]].copy()
     d["fused"], d["tier_mean"] = d["fused"].round(2), d["tier_mean"].round(2)
+    has_tier = d["tier_mean"].notna().any()
     y = alt.Y("aspek:N", sort=hc.ASPECTS, title=None, axis=alt.Axis(labelLimit=220))
     scale = alt.Scale(domain=[0, 5], nice=False)
+    tip = [
+        alt.Tooltip("aspek:N", title="Aspek"),
+        alt.Tooltip("fused:Q", title="Review", format=".2f"),
+    ]
+    if has_tier:
+        tip.append(alt.Tooltip("tier_mean:Q", title=f"Rata-rata {tier}★", format=".2f"))
     bars = (
         alt.Chart(d)
         .mark_bar(size=16, color="#4C78A8", cornerRadiusEnd=3)
         .encode(
             y=y,
             x=alt.X("fused:Q", scale=scale, title="Skor (1-5)", axis=alt.Axis(tickCount=5)),
-            tooltip=[
-                alt.Tooltip("aspek:N", title="Aspek"),
-                alt.Tooltip("fused:Q", title="Review", format=".2f"),
-                alt.Tooltip("tier_mean:Q", title=f"Rata-rata {tier}★", format=".2f"),
-            ],
+            tooltip=tip,
         )
     )
+    height = max(120, 44 * len(d))
+    if not has_tier:
+        return bars.properties(height=height, width="container")
     ticks = (
         alt.Chart(d)
         .mark_tick(color="#E45756", thickness=3, size=26)
         .encode(y=y, x=alt.X("tier_mean:Q", scale=scale))
     )
-    return (bars + ticks).properties(height=max(120, 44 * len(d)), width="container")
+    return (bars + ticks).properties(height=height, width="container")
 
 
 # ------------------------------- UI -------------------------------
@@ -169,9 +179,13 @@ except Exception as e:
     st.stop()
 if bench_is_demo:
     st.warning("benchmark.csv tidak ditemukan. Pembanding di bawah adalah data DUMMY, bukan hasil analisismu.")
-tiers = hc.available_tiers(bench)
-if len(tiers) == 1:
-    st.caption(f"Pembanding saat ini hanya tersedia untuk hotel {tiers[0]}★, sesuai data yang sudah dikumpulkan.")
+bench_tiers = hc.available_tiers(bench)
+if len(bench_tiers) < len(hc.TIERS):
+    st.caption(
+        "Pembanding saat ini baru tersedia untuk hotel "
+        + ", ".join(f"{t}★" for t in bench_tiers)
+        + ". Untuk bintang lain, skor aspek tetap dihitung tapi belum bisa dibandingkan."
+    )
 
 left, right = st.columns([5, 6], gap="large")
 
@@ -191,8 +205,8 @@ with left:
             st.caption("Model saat ini hanya membaca teks. Foto belum ikut dianalisis.")
         star = st.radio(
             "Bintang hotel",
-            tiers,
-            index=tiers.index(3) if 3 in tiers else 0,
+            hc.TIERS,
+            index=hc.TIERS.index(bench_tiers[0]) if bench_tiers else 2,
             horizontal=True,
             format_func=lambda s: "★" * s,
         )
@@ -270,43 +284,60 @@ with right:
         fused = hc.fuse(st.session_state["scores"], user_ratings, w_user)
         table = hc.compare(fused, bench, tier)
         ov = hc.overall(table)
-        near = hc.nearest_tier(fused, bench)[0] if len(tiers) > 1 else None
+        near = hc.nearest_tier(fused, bench)[0] if len(bench_tiers) > 1 else None
+        n_scored = int(table["fused"].notna().sum())
+        has_cmp = ov[0] is not None
         diff = hc.disagreements(fused)
 
         with st.container(border=True):
-            st.markdown(f"##### Hasil · dibanding hotel {tier}★")
-            if ov[0] is None:
+            st.markdown(f"##### Hasil · dibanding hotel {tier}★" if has_cmp else f"##### Hasil · hotel {tier}★")
+            if n_scored == 0:
                 st.info(
                     "Model tidak menemukan aspek di teks ini. Sebutkan hal seperti kamar, kebersihan, "
                     "staf, harga, lokasi, atau makanan, atau isi rating manual di sebelah kiri."
                 )
             else:
                 m1, m2, m3 = st.columns(3)
-                m1.metric("Skor keseluruhan", f"{ov[0]:.2f}/5")
-                m2.metric(f"Rata-rata {tier}★", f"{ov[1]:.2f}/5", f"{ov[0] - ov[1]:+.2f}")
-                if near is not None:
-                    m3.metric("Profil paling mirip", f"{near}★")
+                if has_cmp:
+                    m1.metric("Skor keseluruhan", f"{ov[0]:.2f}/5")
+                    m2.metric(f"Rata-rata {tier}★", f"{ov[1]:.2f}/5", f"{ov[0] - ov[1]:+.2f}")
+                    if near is not None:
+                        m3.metric("Profil paling mirip", f"{near}★")
+                    else:
+                        m3.metric("Aspek dinilai", f"{n_scored}/{len(hc.ASPECTS)}")
+                    st.markdown(hc.rule_summary(table, ov, near, tier, diff))
                 else:
-                    m3.metric("Aspek dinilai", f"{int(table['fused'].notna().sum())}/{len(hc.ASPECTS)}")
+                    m1.metric("Skor keseluruhan", f"{table['fused'].mean():.2f}/5")
+                    m2.metric(f"Rata-rata {tier}★", "belum ada")
+                    m3.metric("Aspek dinilai", f"{n_scored}/{len(hc.ASPECTS)}")
+                    st.info(
+                        f"Belum ada pembanding untuk hotel {tier}★ pada aspek yang dinilai "
+                        "(datanya belum dikumpulkan). Skor tetap dihitung, tapi belum bisa dibandingkan."
+                    )
 
-                st.markdown(hc.rule_summary(table, ov, near, tier, diff))
                 st.altair_chart(bullet_chart(table, tier))
-                st.caption(f"Batang biru = skor review (gabungan). Garis merah = rata-rata hotel {tier}★.")
+                st.caption(
+                    f"Batang biru = skor review (gabungan). Garis merah = rata-rata hotel {tier}★."
+                    if has_cmp
+                    else "Batang biru = skor review (gabungan)."
+                )
 
-                show = table.copy()
+                show = table[["aspek", "model", "user", "fused", "tier_mean", "gap", "status"]].copy()
                 show["status"] = show["status"].map(STATUS_LABEL)
+                for col, spec in (("model", ".1f"), ("user", ".0f"), ("tier_mean", ".2f"), ("gap", "+.2f")):
+                    show[col] = show[col].map(lambda v, s=spec: fmt_num(v, s))
                 st.dataframe(
-                    show[["aspek", "model", "user", "fused", "tier_mean", "gap", "status"]],
+                    show,
                     hide_index=True,
                     column_config={
                         "aspek": "Aspek",
-                        "model": st.column_config.NumberColumn("Model", format="%.1f"),
-                        "user": st.column_config.NumberColumn("Rating kamu", format="%.0f"),
+                        "model": "Model",
+                        "user": "Rating kamu",
                         "fused": st.column_config.ProgressColumn(
                             "Gabungan", min_value=0, max_value=5, format="%.2f"
                         ),
-                        "tier_mean": st.column_config.NumberColumn(f"Rata-rata {tier}★", format="%.2f"),
-                        "gap": st.column_config.NumberColumn("Selisih", format="%+.2f"),
+                        "tier_mean": f"Rata-rata {tier}★",
+                        "gap": "Selisih",
                         "status": "Status",
                     },
                 )
