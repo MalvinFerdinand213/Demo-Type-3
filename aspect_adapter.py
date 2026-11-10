@@ -9,8 +9,11 @@ Kontrak yang dipakai app:
   - star   : int, bintang hotel (belum dipakai)
   - return : {aspek: skor 1.0-5.0, atau None kalau aspek tidak disebut di teks}
 """
+import csv
 import hashlib
+import os
 import random
+import re
 
 import aspect_model as am
 from hotel_core import ASPECTS
