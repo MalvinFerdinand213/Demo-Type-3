@@ -3,6 +3,7 @@ import hashlib
 import os
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -16,7 +17,8 @@ import hotel_core as hc
 # Secrets dengan nama GEMINI_API_KEY. Kode ini membacanya otomatis.
 GEMINI_API_KEY = ""
 
-GEMINI_MODELS = ["gemini-3.8-flash", "gemini-2.5-flash"]  # dicoba berurutan
+# Model dicoba berurutan. Kalau semuanya gagal, app mencari sendiri model "flash" yang tersedia untuk key-mu.
+GEMINI_MODELS = ["gemini-2.5-flash"]
 MAX_SUMMARIES_PER_SESSION = 5  # batas panggilan Gemini per pengunjung
 USE_DEMO_DEFAULT = False  # True = skor dummy (hanya untuk mencoba tampilan)
 MAX_TEXT_CHARS = 3000
@@ -67,6 +69,63 @@ def get_api_key() -> str:
         return os.getenv("GEMINI_API_KEY", "")
 
 
+class GeminiUnavailable(Exception):
+    """Semua percobaan ke Gemini gagal. `attempts` = [(nama_model, deskripsi_error), ...]."""
+
+    def __init__(self, attempts):
+        super().__init__("; ".join(f"{m}: {d}" for m, d in attempts))
+        self.attempts = attempts
+
+
+def _describe_error(e, api_key) -> str:
+    code = getattr(e, "code", None) or getattr(e, "status_code", None)
+    status = getattr(e, "status", None)
+    msg = getattr(e, "message", None) or str(e)
+    head = " ".join(str(x) for x in (code, status) if x)
+    out = f"{head}: {msg}" if head else str(msg)
+    if api_key:
+        out = out.replace(api_key, "***")
+    return out[:240]
+
+
+def _key_rejected(desc: str) -> bool:
+    d = desc.lower()
+    return any(s in d for s in ("api key", "api_key", "unauthenticated", "permission_denied", "401", "403"))
+
+
+def gemini_hint(attempts) -> str:
+    blob = " ".join(d for _, d in attempts).lower()
+    if _key_rejected(blob):
+        return "API key ditolak. Pakai key dari aistudio.google.com/apikey (biasanya diawali AIza) dan pastikan belum dihapus."
+    if "429" in blob or "resource_exhausted" in blob or "quota" in blob:
+        return "Kuota Gemini habis. Coba lagi nanti atau cek kuota key-mu."
+    if "404" in blob or "not_found" in blob or "not found" in blob:
+        return "Nama model tidak tersedia untuk key ini. Ubah isi GEMINI_MODELS di app_hotel.py."
+    return ""
+
+
+def _make_client(genai, api_key):
+    # Key berawalan "AQ." adalah key Vertex AI (express mode), bukan key Gemini Developer API.
+    if api_key.startswith("AQ."):
+        return genai.Client(vertexai=True, api_key=api_key), True
+    return genai.Client(api_key=api_key), False
+
+
+def _discover_flash_models(client) -> list:
+    found = []
+    try:
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").replace("models/", "")
+            actions = getattr(m, "supported_actions", None) or []
+            if "flash" in name and "generateContent" in actions and not any(
+                s in name for s in ("image", "tts", "live", "audio", "embedding", "native")
+            ):
+                found.append(name)
+    except Exception:
+        pass
+    return sorted(set(found), reverse=True)
+
+
 def gemini_summary(api_key, tier, w_user, table, ov, near, excerpt):
     # Diimpor di sini supaya app tetap jalan walau google-genai belum terpasang
     from google import genai
@@ -91,18 +150,35 @@ def gemini_summary(api_key, tier, w_user, table, ov, near, excerpt):
     if excerpt:
         prompt += f"\n<teks>\n{excerpt}\n</teks>\n"
 
-    client = genai.Client(api_key=api_key)
-    last_err = None
-    for name in GEMINI_MODELS:
-        try:
-            resp = client.models.generate_content(
-                model=name, contents=prompt, config=types.GenerateContentConfig(temperature=0.3)
-            )
-            if resp.text:
-                return resp.text
-        except Exception as e:  # coba model berikutnya
-            last_err = e
-    raise last_err or RuntimeError("Gemini tidak mengembalikan teks.")
+    client, vertex = _make_client(genai, api_key)
+    attempts, tried = [], set()
+
+    def try_models(names):
+        for name in names:
+            if name in tried:
+                continue
+            tried.add(name)
+            try:
+                resp = client.models.generate_content(
+                    model=name, contents=prompt, config=types.GenerateContentConfig(temperature=0.3)
+                )
+                if resp.text:
+                    return resp.text
+                attempts.append((name, "respons kosong"))
+            except Exception as e:
+                desc = _describe_error(e, api_key)
+                attempts.append((name, desc))
+                if _key_rejected(desc):  # key ditolak: model lain pasti ikut gagal
+                    return None
+        return None
+
+    text = try_models(GEMINI_MODELS)
+    rejected = bool(attempts) and _key_rejected(attempts[-1][1])
+    if text is None and not vertex and not rejected:
+        text = try_models(_discover_flash_models(client)[:4])
+    if text is None:
+        raise GeminiUnavailable(attempts)
+    return text
 
 
 def input_signature(text, images, star, demo) -> str:
@@ -265,6 +341,63 @@ with left:
             except Exception as e:
                 st.error(f"Model gagal menilai: {e}")
 
+    # ---------------- bandingkan dengan modelmu (di bawah tombol Analisis) ----------------
+    if "scores" in st.session_state:
+        with st.container(border=True):
+            st.markdown("##### 3 · Bandingkan dengan modelmu")
+            ref_csv = ad.reference_scores(st.session_state["text"], [], st.session_state["tier"])
+            with st.expander("Isi skor modelmu manual"):
+                st.caption(
+                    "Skala 1-5. Kosongkan kalau tidak ada. Isian di sini menggantikan skor dari "
+                    "reference_scores.csv."
+                )
+                r1, r2 = st.columns(2)
+                manual = {}
+                for i, a in enumerate(hc.ASPECTS):
+                    with (r1 if i % 2 == 0 else r2):
+                        manual[a] = st.number_input(
+                            f"{ICONS[a]} {a}",
+                            min_value=1.0,
+                            max_value=5.0,
+                            value=None,
+                            step=0.1,
+                            format="%.1f",
+                            key=f"ref_{a}",
+                        )
+            ref = {a: manual[a] if manual[a] is not None else (ref_csv or {}).get(a) for a in hc.ASPECTS}
+
+            if all(v is None for v in ref.values()):
+                st.caption(
+                    "Belum ada skor modelmu untuk review ini. Isi manual di atas, atau siapkan "
+                    "reference_scores.csv (lihat reference_scores_template.csv)."
+                )
+            else:
+                rows = []
+                for a in hc.ASPECTS:
+                    m, r = st.session_state["scores"].get(a), ref.get(a)
+                    m = np.nan if m is None else float(m)
+                    r = np.nan if r is None else float(r)
+                    rows.append({"Aspek": a, "m": m, "r": r, "d": r - m})
+                cmp_df = pd.DataFrame(rows)
+                both = cmp_df.dropna(subset=["m", "r"])
+                src = "input manual" if any(v is not None for v in manual.values()) else "reference_scores.csv"
+                st.caption(f"Sumber skor modelmu: {src}. Selisih = modelmu − model app.")
+                if len(both):
+                    k1, k2, k3 = st.columns(3)
+                    k1.metric("Aspek dibandingkan", f"{len(both)}/{len(hc.ASPECTS)}")
+                    k2.metric("Rata-rata selisih", f"{both['d'].abs().mean():.2f}")
+                    corr = both["m"].corr(both["r"]) if len(both) >= 3 else np.nan
+                    k3.metric("Korelasi", fmt_num(corr, ".2f"))
+                show_cmp = pd.DataFrame(
+                    {
+                        "Aspek": cmp_df["Aspek"],
+                        "Model app": cmp_df["m"].map(lambda v: fmt_num(v, ".1f")),
+                        "Modelmu": cmp_df["r"].map(lambda v: fmt_num(v, ".1f")),
+                        "Selisih": cmp_df["d"].map(lambda v: fmt_num(v, "+.1f")),
+                    }
+                )
+                st.dataframe(show_cmp, hide_index=True)
+
 # ----------------------------- kanan: hasil -----------------------------
 with right:
     if "scores" not in st.session_state:
@@ -374,10 +507,18 @@ with right:
                             )
                         st.session_state["summary_sig"] = now_sig
                         st.session_state["n_summaries"] = used + 1
-                    except Exception as e:
-                        detail = f": {e}" if demo else ""
+                    except GeminiUnavailable as e:
                         st.warning(
-                            f"Kesimpulan Gemini belum bisa dibuat ({type(e).__name__}{detail}). "
+                            "Kesimpulan Gemini belum bisa dibuat. Ringkasan otomatis di atas tetap berlaku. "
+                            + gemini_hint(e.attempts)
+                        )
+                        with st.expander("Detail teknis"):
+                            for m, d in e.attempts:
+                                st.caption(f"{m} → {d}")
+                    except Exception as e:
+                        msg = str(e).replace(api_key, "***")[:160]
+                        st.warning(
+                            f"Kesimpulan Gemini belum bisa dibuat ({type(e).__name__}: {msg}). "
                             "Ringkasan otomatis di atas tetap berlaku."
                         )
                 if "summary" in st.session_state:
