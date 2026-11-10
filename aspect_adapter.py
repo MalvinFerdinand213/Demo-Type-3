@@ -54,3 +54,45 @@ def demo_scores(text: str, images: list, star: int) -> dict:
     key = f"{text}|{len(images)}|{star}".encode()
     rng = random.Random(int(hashlib.sha256(key).hexdigest(), 16) % (2**32))
     return {a: round(min(5.0, max(1.0, rng.gauss(2.2 + 0.4 * star, 0.9))), 1) for a in ASPECTS}
+
+
+# ---------------- skor "modelmu" (Qwen3-VL) untuk perbandingan ----------------
+REFERENCE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reference_scores.csv")
+_REF = None
+
+
+def _norm(text) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+
+def _load_reference() -> dict:
+    """Baca reference_scores.csv: kolom review_text + satu kolom per aspek (skala 1-5)."""
+    global _REF
+    if _REF is None:
+        _REF = {}
+        if os.path.exists(REFERENCE_PATH):
+            with open(REFERENCE_PATH, encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                cols = {(c or "").strip().lower(): c for c in (reader.fieldnames or [])}
+                tcol = cols.get("review_text") or cols.get("text")
+                if tcol:
+                    for row in reader:
+                        scores = {}
+                        for a in ASPECTS:
+                            raw = row.get(cols.get(a.lower(), ""), None)
+                            try:
+                                scores[a] = float(str(raw).replace(",", ".")) if str(raw or "").strip() else None
+                            except ValueError:
+                                scores[a] = None
+                        _REF[_norm(row[tcol])] = scores
+    return _REF
+
+
+def reference_scores(text: str, images: list, star: int):
+    """Skor aspek dari modelmu untuk review ini, atau None kalau tidak ada.
+
+    Sekarang dibaca dari reference_scores.csv (dicocokkan lewat teks review). Kalau modelmu bisa
+    dipanggil langsung dari app (misalnya lewat API), ganti isi fungsi ini dengan pemanggilannya.
+    Kembalian: {aspek: skor 1-5 atau None}.
+    """
+    return _load_reference().get(_norm(text))
