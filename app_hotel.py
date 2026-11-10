@@ -96,7 +96,7 @@ def _key_rejected(desc: str) -> bool:
 def gemini_hint(attempts) -> str:
     blob = " ".join(d for _, d in attempts).lower()
     if _key_rejected(blob):
-        return "API key ditolak. Pakai key dari aistudio.google.com/apikey (biasanya diawali AIza) dan pastikan belum dihapus."
+        return "API key ditolak. Pakai key dari aistudio.google.com/apikey dan pastikan belum dihapus."
     if "429" in blob or "resource_exhausted" in blob or "quota" in blob:
         return "Kuota Gemini habis. Coba lagi nanti atau cek kuota key-mu."
     if "404" in blob or "not_found" in blob or "not found" in blob:
@@ -104,11 +104,13 @@ def gemini_hint(attempts) -> str:
     return ""
 
 
-def _make_client(genai, api_key):
-    # Key berawalan "AQ." adalah key Vertex AI (express mode), bukan key Gemini Developer API.
+def _make_clients(genai, api_key):
+    """Daftar (client, vertex?) yang dicoba berurutan. Key "AQ." bisa dari AI Studio maupun
+    Vertex AI, jadi dicoba lewat Gemini Developer API dulu, lalu mode Vertex."""
+    out = [(genai.Client(api_key=api_key), False)]
     if api_key.startswith("AQ."):
-        return genai.Client(vertexai=True, api_key=api_key), True
-    return genai.Client(api_key=api_key), False
+        out.append((genai.Client(vertexai=True, api_key=api_key), True))
+    return out
 
 
 def _discover_flash_models(client) -> list:
@@ -150,32 +152,35 @@ def gemini_summary(api_key, tier, w_user, table, ov, near, excerpt):
     if excerpt:
         prompt += f"\n<teks>\n{excerpt}\n</teks>\n"
 
-    client, vertex = _make_client(genai, api_key)
     attempts, tried = [], set()
+    text = None
+    for client, vertex in _make_clients(genai, api_key):
+        mode = "Vertex" if vertex else "API"
 
-    def try_models(names):
-        for name in names:
-            if name in tried:
-                continue
-            tried.add(name)
-            try:
-                resp = client.models.generate_content(
-                    model=name, contents=prompt, config=types.GenerateContentConfig(temperature=0.3)
-                )
-                if resp.text:
-                    return resp.text
-                attempts.append((name, "respons kosong"))
-            except Exception as e:
-                desc = _describe_error(e, api_key)
-                attempts.append((name, desc))
-                if _key_rejected(desc):  # key ditolak: model lain pasti ikut gagal
-                    return None
-        return None
+        def try_models(names):
+            for name in names:
+                if (mode, name) in tried:
+                    continue
+                tried.add((mode, name))
+                try:
+                    resp = client.models.generate_content(
+                        model=name, contents=prompt, config=types.GenerateContentConfig(temperature=0.3)
+                    )
+                    if resp.text:
+                        return resp.text, False
+                    attempts.append((f"{name} [{mode}]", "respons kosong"))
+                except Exception as e:
+                    desc = _describe_error(e, api_key)
+                    attempts.append((f"{name} [{mode}]", desc))
+                    if _key_rejected(desc):  # key ditolak di mode ini
+                        return None, True
+            return None, False
 
-    text = try_models(GEMINI_MODELS)
-    rejected = bool(attempts) and _key_rejected(attempts[-1][1])
-    if text is None and not vertex and not rejected:
-        text = try_models(_discover_flash_models(client)[:4])
+        text, rejected = try_models(GEMINI_MODELS)
+        if text is None and not vertex and not rejected:
+            text, rejected = try_models(_discover_flash_models(client)[:4])
+        if text is not None:
+            break
     if text is None:
         raise GeminiUnavailable(attempts)
     return text
